@@ -1,0 +1,77 @@
+import urllib.request
+import json
+
+
+API = "https://api.frankfurter.dev/v2/rates"
+
+
+def getexr(base="THB", currencies=None):
+
+    if currencies is None:
+        currencies = [
+            "USD",
+            "EUR",
+            "GBP",
+            "JPY",
+            "CNY",
+            "KRW",
+            "SGD",
+            "AUD",
+            "CAD"
+        ]
+
+    quotes = ",".join(currencies)
+
+    url = f"{API}?base={base}&quotes={quotes}"
+
+    try:
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "EXORA-CurrencyExchange/1.0"
+            }
+        )
+
+        with urllib.request.urlopen(request, timeout=10) as response:
+
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        rates = {}
+
+        if isinstance(data, list):
+
+            for item in data:
+
+                quote = item.get("quote")
+                rate = item.get("rate")
+
+                if quote and rate is not None:
+
+                    rates[quote] = float(rate)
+
+        return {
+            "success": True,
+            "base": base,
+            "rates": rates,
+            "date": data[0].get("date") if data else None
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e),
+            "base": base,
+            "rates": {}
+        }
+
+
+def get_exchange_rates(base="THB", currencies=None):
+
+    return getexr(
+        base=base,
+        currencies=currencies
+    )

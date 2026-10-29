@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="160" viewBox="0 0 640 160">
+<g transform="translate(12 16)"><circle cx="64" cy="64" r="60" fill="#125b4a"/><circle cx="64" cy="64" r="49" fill="none" stroke="#71a18a"/>
+<polygon fill="#ffffff" points="58,59 62,48 100,22 80,62 69,69"/>
+<polygon fill="#d8ef9a" points="70,69 66,80 28,106 48,66 59,59"/>
+<polygon fill="#ffffff" points="58,62 46,58 23,23 58,46 66,58"/>
+<polygon fill="#d8ef9a" points="70,66 82,70 105,105 70,82 62,70"/>
+<circle cx="64" cy="64" r="6" fill="#125b4a"/></g>
+<text x="162" y="99" fill="#125b4a" font-family="Tahoma, sans-serif" font-size="72" font-weight="700" letter-spacing="5">EXORA</text>
+<text x="168" y="132" fill="#617c66" font-family="Tahoma, sans-serif" font-size="13" letter-spacing="3">EXCHANGE FOR YOUR NEXT JOURNEY</text></svg>

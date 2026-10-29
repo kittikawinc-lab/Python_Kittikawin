@@ -1,0 +1,234 @@
+"""Bank-account checkout and manually recorded settlement; no bank automation."""
+import json
+from pathlib import Path
+from datetime import datetime,timedelta
+from EXORA_i18n import tk,ttk,filedialog,messagebox
+import EXORA_bank_flow as flow
+import EXORA_database as db
+import EXORA_profiles as profiles
+import EXORA_receipts as receipts
+import EXORA_banks as banks
+import EXORA_identity_docs as documents
+import EXORA_saved_accounts_ui as account_ui
+from PIL import ImageTk,ImageOps
+
+# เลือกเอกสารหนึ่งประเภทก่อนเปิดหน้าต่างแนบภาพ
+DOCUMENT_TYPES={'บัตรประชาชน':'id_card','หนังสือเดินทาง':'passport'}
+def document_picker(app,parent,win,on_choose,on_change=None):
+    app.label(parent,'เลือกประเภทเอกสาร (อย่างใดอย่างหนึ่ง)',11).pack(anchor='w',pady=(10,4))
+    selected=tk.StringVar(value='')
+    selector=ttk.Combobox(parent,textvariable=selected,values=list(DOCUMENT_TYPES),state='readonly')
+    selector.pack(fill='x',pady=4)
+    def choose():
+        kind=DOCUMENT_TYPES.get(selected.get())
+        if not kind:raise ValueError('กรุณาเลือกประเภทเอกสารก่อนแนบภาพ')
+        path=filedialog.askopenfilename(parent=win,title='เลือกภาพเอกสาร',filetypes=[('JPG / PNG','*.jpg *.jpeg *.png')])
+        if path:on_choose(kind,path)
+    button=app.button(parent,'แนบภาพเอกสาร',choose,'secondary');button.configure(state='disabled');button.pack(fill='x',pady=4)
+    def changed(*args):
+        button.configure(state='normal' if selected.get() in DOCUMENT_TYPES else 'disabled')
+        if on_change:on_change()
+    selected.trace_add('write',changed)
+    return selector,button
+
+# รายการใหม่เริ่มจากบัญชีผู้รับ ไม่เปิด QR หรือช่องทางจำลอง
+def create(app,price=None):
+    app.ensure_not_preview();actor=app.current_user['id'];win=app.dialog('EXORA | โอนบัญชีธนาคาร',700,820,key='create-bank-order')
+    if win is None:return
+    body=app.scroll_dialog(win)
+    app.label(body,'บัญชีรับเงินของลูกค้า',19,bold=True).pack(anchor='w',pady=8)
+    app.label(body,'ร้านตรวจข้อมูลและยืนยันช่องทางธนาคารก่อนเปิดให้ชำระเงิน',11,wraplength=620).pack(anchor='w')
+    profile=profiles.get_profile(actor)
+    app.label(body,'อีเมลรับใบเสร็จ: '+str(profile.get('email') or '—'),11,wraplength=620).pack(anchor='w',pady=6)
+    app.label(body,'เบอร์โทรจากโปรไฟล์: '+str(profile.get('phone') or '—'),11,wraplength=620).pack(anchor='w',pady=6)
+    chooser=tk.Frame(body,bg=body.cget('bg'));chooser.pack(fill='x')
+    values={};attachment={'path':None,'kind':None}
+    for key,label in [('recipient','ชื่อบัญชีผู้รับเงิน'),('bank','ธนาคารผู้รับ / SWIFT'),('account','เลขบัญชีผู้รับ / IBAN'),('country','ประเทศปลายทาง')]:values[key],_=app.field(body,label)
+    account_ui.selector(app,chooser,'recipient',values)
+    remember,set_default=account_ui.remember_options(app,body)
+    confirmed=tk.BooleanVar(value=False)
+    for key in ('recipient','bank','account','country'):values[key].trace_add('write',lambda *args:confirmed.set(False))
+    ttk.Checkbutton(body,text='ตรวจสอบบัญชีรับเงินและอีเมลถูกต้องแล้ว',variable=confirmed).pack(anchor='w',pady=8)
+    values['amount'],_=app.field(body,'จำนวนเงินต้นทาง (สูงสุด 1,000 ต่อรายการ)',str(price['from_amount']) if price else '1000')
+    selling=bool(price and price['from_currency']!='THB')
+    direction=tk.StringVar(value='ขายเงินต่างประเทศ' if selling else 'ซื้อเงินต่างประเทศ')
+    ttk.Combobox(body,textvariable=direction,values=['ซื้อเงินต่างประเทศ','ขายเงินต่างประเทศ'],state='readonly').pack(fill='x',pady=8)
+    target=tk.StringVar(value=price['from_currency'] if selling else price['to_currency'] if price else 'USD')
+    app.label(body,'สกุลเงินต่างประเทศ',11).pack(anchor='w',pady=8)
+    ttk.Combobox(body,textvariable=target,values=[r[1] for r in db.getcurs() if r[1]!='THB'],state='readonly').pack(fill='x')
+    app.label(body,'ซื้อ: จ่าย THB รับเงินต่างประเทศ · ขาย: จ่ายเงินต่างประเทศ รับ THB',10,wraplength=620).pack(anchor='w',pady=8)
+    doc_frame=tk.Frame(body,bg=body.cget('bg'));doc_frame.pack(fill='x')
+    identity_hint=app.label(body,'',11,wraplength=620);identity_hint.pack(anchor='w',pady=8)
+    filename=app.label(doc_frame,'แนบเอกสารเมื่อยังไม่เคยยืนยันตัวตน',10);filename.pack(anchor='w',pady=8)
+    def choose(kind,path):
+        attachment.update(path=path,kind=kind);filename.configure(text=Path(path).name)
+    def reset_attachment():
+        attachment.update(path=None,kind=None);filename.configure(text='ยังไม่ได้แนบภาพเอกสาร')
+    document_picker(app,doc_frame,win,choose,reset_attachment)
+    def identity_hint_update(*args):
+        from EXORA_identity import valid
+        conn=db.getconnect()
+        try:cached=valid(conn,actor,values['recipient'].get())
+        finally:conn.close()
+        if cached:
+            doc_frame.pack_forget();attachment['path']=None
+            identity_hint.configure(text='ยืนยันตัวตนแล้ว สร้างรายการเพื่อขอคำนวณยอดได้ทันที')
+        else:
+            if not doc_frame.winfo_manager():doc_frame.pack(fill='x',before=identity_hint)
+            identity_hint.configure(text='แนบเอกสารครั้งแรก หรือเมื่อข้อมูลตัวตนเปลี่ยน')
+    values['recipient'].trace_add('write',identity_hint_update);identity_hint_update()
+    def save():
+        if not confirmed.get():raise ValueError('กรุณาตรวจสอบและยืนยันบัญชีรับเงินก่อนส่งรายการ')
+        sell=direction.get()=='ขายเงินต่างประเทศ'
+        number=flow.create(actor,*(values[k].get() for k in ('recipient','bank','account','country')),target.get() if sell else 'THB','THB' if sell else target.get(),values['amount'].get(),save_account=remember.get(),set_default=set_default.get())
+        if attachment['path']:
+            try:documents.upload(actor,attachment['kind'],attachment['path'])
+            except Exception:
+                win.destroy();app.bank_flow_page();detail(app,number)
+                raise ValueError('บันทึกรายการแล้ว แต่แนบเอกสารไม่สำเร็จ กรุณาแนบใหม่ในรายละเอียด') from None
+        if flow.identity_status(number,actor):
+            try:flow.quote(number,actor)
+            except ValueError as error:messagebox.showinfo('EXORA','สร้างรายการแล้ว: '+str(error),parent=win)
+        win.destroy();app.bank_flow_page();detail(app,number)
+    app.button(body,'สร้างรายการ / ดำเนินการต่อ',save).pack(fill='x',pady=20)
+
+# อ่านรายการตามสิทธิ์ เจ้าหน้าที่ตรวจรายการเริ่มต้นได้ก่อนมีการชำระ
+def show(app):
+    body=app.page('รายการทั้งหมด','TRANSACTION WORKSPACE')
+    controls=tk.Frame(body,bg=body.cget('bg'));controls.pack(fill='x',pady=8)
+    status=tk.StringVar(value='ทั้งหมด');search=tk.StringVar()
+    ttk.Combobox(controls,textvariable=status,values=['ทั้งหมด','รอดำเนินการ','เสร็จสิ้น','ไม่ผ่าน'],state='readonly',width=16).pack(side='left',padx=5)
+    app.label(controls,'ค้นหารายการ',11).pack(side='left',padx=5)
+    entry=ttk.Entry(controls,textvariable=search,width=24);entry.pack(side='left',padx=5)
+    tree=app.table(body,('number','type','status','amount','source','target'),('เลขรายการ','ซื้อ / ขาย','สถานะ','จำนวน','จากสกุลเงิน','เป็นสกุลเงิน'),10,[260,200,360,140,120,120])
+    def matches(state,values,legacy=False):
+        category='ไม่ผ่าน' if state=='rejected' else 'เสร็จสิ้น' if state in ('completed','approved','legacy') else 'รอดำเนินการ'
+        return (status.get()=='ทั้งหมด' or status.get()==category) and (not search.get().strip() or search.get().strip().casefold() in str(values).casefold())
+    def load():
+        tree.delete(*tree.get_children());rows=flow.listing(app.current_user['id']);known={row['number'] for row in rows}
+        for row in rows:
+            if not matches(row['status'],row):continue
+            tree.insert('','end',iid=row['number'],values=(row['number'],'ซื้อเงินต่างประเทศ' if row['source']=='THB' else 'ขายเงินต่างประเทศ',flow.STATES[row['status']],row['amount'],row['source'],row['target']))
+        import EXORA_payments as payments
+        for row in payments.list_transactions(app.current_user['id'],own_only=False):
+            if row[0] in known or not matches(row[9],row,True):continue
+            tree.insert('','end',iid='legacy:'+row[0],values=(row[0],'รายการเดิม',{'pending':'รอตรวจสอบ','approved':'อนุมัติแล้ว','rejected':'ปฏิเสธ','legacy':'รายการเดิม'}.get(row[9],row[9]),row[4],row[3],row[5]))
+    status.trace_add('write',lambda *args:app.safe(load));search.trace_add('write',lambda *args:app.safe(load))
+    def selected():
+        selection=tree.selection()
+        if not selection:raise ValueError('กรุณาเลือกรายการ')
+        if selection[0].startswith('legacy:'):app.detail(selection[0][7:])
+        else:detail(app,selection[0])
+    app.button(controls,'ดูรายละเอียด',selected,'secondary').pack(side='left',padx=5)
+    app.button(controls,'รีเฟรช',load,'secondary').pack(side='left',padx=5)
+    tree.bind('<Double-1>',lambda event:app.safe(selected));load()
+    # เปิดหลายหน้าต่างแล้วรายการอัปเดตเอง โดยไม่รบกวนแถวที่เลือก
+    refresh_timer={'id':None}
+    def refresh():
+        if not tree.winfo_exists():return
+        selection=tree.selection();position=tree.yview()
+        app.safe(load)
+        tree.selection_set([key for key in selection if tree.exists(key)])
+        if position:tree.yview_moveto(position[0])
+        refresh_timer['id']=body.after(3000,refresh)
+    def cleanup(event):
+        if event.widget is body and refresh_timer['id']:
+            try:body.after_cancel(refresh_timer['id'])
+            except tk.TclError:pass
+    body.bind('<Destroy>',cleanup,add='+');refresh_timer['id']=body.after(3000,refresh)
+
+# รายละเอียดเปิดเฉพาะคำสั่งที่ตรงสถานะจริง ไม่อนุมัติการโอนจากสลิปเพียงอย่างเดียว
+def detail(app,number):
+    actor=app.current_user['id'];row=flow.get(number,actor);win=app.dialog('EXORA | โอนบัญชีธนาคาร',850,850,key=('bank-order',number))
+    if win is None:return
+    body=app.scroll_dialog(win)
+    app.label(body,flow.STATES[row['status']],20,bold=True,wraplength=740).pack(anchor='w',pady=8)
+    if row.get('feedback'):app.label(body,row['feedback'],12,'#ab4b3c',wraplength=740).pack(anchor='w',pady=8)
+    verified=flow.identity_status(number,actor)
+    app.label(body,'ยืนยันตัวตนบัญชีแล้ว ใช้ผลเดิมได้' if verified else 'ยังไม่มีผลยืนยันตัวตนที่ใช้ได้',11,app.green if verified else '#ab4b3c',wraplength=740).pack(anchor='w',pady=8)
+    for label,value in [('เลขรายการ',number),('ชื่อบัญชีผู้รับเงิน',row['recipient']),('ธนาคารผู้รับ / SWIFT',row['bank']),('เลขบัญชีผู้รับ / IBAN',row['account']),('ประเทศปลายทาง',row['country'])]:app.label(body,label+': '+str(value),11,wraplength=740).pack(anchor='w',pady=5)
+    if row['quote']:
+        quote=json.loads(row['quote']);app.label(body,f"{quote['from_amount']:,.2f} {row['source']} → {quote['to_amount']:,.2f} {row['target']}",18,app.green,bold=True).pack(anchor='w',pady=15)
+        app.label(body,'ราคานี้ใช้ได้ถึง '+datetime.fromtimestamp(quote['quote_expires']).strftime('%Y-%m-%d %H:%M'),10).pack(anchor='w')
+    def reload():win.destroy();app.bank_flow_page();detail(app,number)
+    def invoke(job):app.ensure_not_preview();job();reload()
+    # แสดงภาพถอดรหัสในหน่วยความจำเท่านั้น ไม่สร้างไฟล์ภาพเอกสารแบบเปิดเผย
+    document=documents.current(row['user_id'])
+    if document:
+        app.label(body,'เอกสารที่แนบ: '+('บัตรประชาชน' if document['kind']=='id_card' else 'หนังสือเดินทาง'),11,app.green).pack(anchor='w',pady=6)
+        def view_document():
+            image=documents.image(actor,row['user_id']);viewer=app.dialog('เอกสารยืนยันตัวตน',1000,800,key=('identity-image',row['user_id']))
+            if viewer is None:return
+            canvas=tk.Canvas(viewer,bg='#173e33',highlightthickness=0);canvas.pack(fill='both',expand=True)
+            def draw(event):
+                fitted=ImageOps.contain(image,(max(1,event.width),max(1,event.height)))
+                canvas.photo=ImageTk.PhotoImage(fitted);canvas.delete('all');canvas.create_image(event.width//2,event.height//2,image=canvas.photo)
+            canvas.bind('<Configure>',draw)
+        app.button(body,'เปิดเอกสารยืนยันตัวตน',view_document,'secondary').pack(fill='x',pady=8)
+    if not verified and actor==row['user_id']:
+        def upload(kind,path):invoke(lambda:documents.upload(actor,kind,path))
+        document_picker(app,body,win,upload)
+    if verified and actor==row['user_id'] and row['status'] in ('identity_pending','identity_verified','route_pending','quoted','quote_pending_route'):
+        app.button(body,'รับราคา / คำนวณใหม่',lambda:invoke(lambda:flow.quote(number,actor))).pack(fill='x',pady=10)
+    if verified and actor==row['user_id'] and row['status']=='quoted':
+        store=profiles.shop();app.label(body,'บัญชีร้านที่รับเงิน',14,bold=True).pack(anchor='w',pady=10)
+        app.label(body,' / '.join(store.get(k,'') for k in ('bank_name','bank_account_name','bank_account_number')),12,app.green,wraplength=740).pack(anchor='w')
+        app.label(body,'โอนยอด '+row['source']+' ตามราคา แล้วกรอกข้อมูลผู้โอนและแนบหลักฐาน',11,wraplength=740).pack(anchor='w',pady=8)
+        profile=profiles.get_profile(actor)
+        app.label(body,'อีเมลรับใบเสร็จ: '+str(profile.get('email') or '—'),11,wraplength=740).pack(anchor='w',pady=8)
+        chooser=tk.Frame(body,bg=body.cget('bg'));chooser.pack(fill='x')
+        payment={'payer_bank':banks.selector(body)}
+        for key,label in [('payer_name','ชื่อบัญชีผู้โอน'),('payer_account','เลขบัญชีผู้โอน')]:payment[key],_=app.field(body,label)
+        account_ui.selector(app,chooser,'payer',payment)
+        remember,set_default=account_ui.remember_options(app,body)
+        amount,amount_entry=app.field(body,'ยอดโอน ('+row['source']+')',str(json.loads(row['quote'])['from_amount']))
+        amount_entry.configure(state='readonly')
+        payment['transfer_amount']=amount
+        for key,label in [('transfer_at','วันเวลาโอน (YYYY-MM-DD HH:MM)'),('transfer_reference','เลขอ้างอิงการชำระ')]:payment[key],_=app.field(body,label)
+        confirmed=tk.BooleanVar(value=False)
+        for key in ('payer_name','payer_bank','payer_account'):payment[key].trace_add('write',lambda *args:confirmed.set(False))
+        ttk.Checkbutton(body,text='ตรวจสอบบัญชีผู้โอนและยอดชำระถูกต้องแล้ว',variable=confirmed).pack(anchor='w',pady=8)
+        def submit():
+            if not confirmed.get():raise ValueError('กรุณาตรวจสอบและยืนยันข้อมูลผู้โอนก่อนส่งหลักฐาน')
+            path=filedialog.askopenfilename(parent=win,title='เลือกหลักฐาน',filetypes=[('JPG / PNG','*.jpg *.jpeg *.png')])
+            if path:invoke(lambda:flow.submit_payment(number,actor,{**{k:v.get() for k,v in payment.items()},'remember_payer':remember.get(),'default_payer':set_default.get()},path))
+        app.button(body,'ส่งหลักฐานให้เจ้าหน้าที่ตรวจสอบ',submit).pack(fill='x',pady=15)
+    if app.is_admin_view() and actor!=row['user_id']:
+        if row['status'] in ('identity_pending','route_pending','identity_verified','quote_pending_route') or not verified:
+            app.label(body,'ผลตรวจเอกสารและบัญชีรับเงิน',15,bold=True).pack(anchor='w',pady=10)
+            decision=tk.StringVar(value='ผ่าน');reason=tk.StringVar(value='ภาพเอกสารไม่ชัดเจน')
+            ttk.Combobox(body,textvariable=decision,values=['ผ่าน','ขอข้อมูลเพิ่มเติม','ไม่ผ่าน'],state='readonly').pack(fill='x',pady=6)
+            ttk.Combobox(body,textvariable=reason,values=list(flow.REVIEW_REASONS),state='readonly').pack(fill='x',pady=6)
+            checks={}
+            for key,title in [('document','ตรวจเอกสารจริงและวันหมดอายุแล้ว'),('holder','ชื่อและตัวตนตรงกับเจ้าของบัญชี'),('route','ธนาคารรองรับประเทศ สกุลเงิน และยอดสุทธิแล้ว')]:
+                checks[key]=tk.BooleanVar(value=False)
+                ttk.Checkbutton(body,text=title,variable=checks[key]).pack(anchor='w',pady=5)
+            expiry,_=app.field(body,'ใช้ผลได้ถึง YYYY-MM-DD (ไม่เกินวันหมดอายุเอกสาร)',(datetime.now()+timedelta(days=365)).date().isoformat())
+            def review():
+                flow.review_choice(number,actor,decision.get(),reason.get(),{k:v.get() for k,v in checks.items()},expiry.get(),document['id'] if document else -1)
+            app.button(body,'บันทึกผลตรวจ',lambda:invoke(review)).pack(fill='x',pady=10)
+        if verified:app.button(body,'ถอนผลยืนยันตัวตน',lambda:invoke(lambda:flow.revoke_identity(number,actor)),'danger').pack(anchor='w',pady=8)
+        if row['status']=='payment_pending':
+            import EXORA_payments as payments
+            transaction=payments.get_transaction(number,actor)
+            app.button(body,'เปิดสลิปขนาดเต็ม',lambda:__import__('os').startfile(str(payments.slip_path(transaction))),'secondary').pack(anchor='w',pady=8)
+            reference,_=app.field(body,'เลขอ้างอิงเงินเข้าที่ตรวจจากธนาคาร')
+            app.button(body,'ยืนยันรับเงินจริงเข้าบัญชีร้าน',lambda:invoke(lambda:flow.verify_payment(number,actor,reference.get()))).pack(fill='x',pady=10)
+        if row['status']=='payment_verified':app.button(body,'เริ่มดำเนินการโอนจ่าย',lambda:invoke(lambda:flow.start_payout(number,actor))).pack(fill='x',pady=15)
+        if row['status']=='payout_processing':
+            app.label(body,'โอนผ่านธนาคารของร้าน ตรวจชื่อผู้รับ ยอดและสกุลเงินก่อนยืนยัน ห้ามโอนซ้ำหากยังไม่ทราบผล',11,'#ab4b3c',wraplength=740).pack(anchor='w',pady=10)
+            reference,_=app.field(body,'เลขอ้างอิงการโอนจ่ายจากธนาคาร')
+            def complete():
+                app.ensure_not_preview()
+                path=filedialog.askopenfilename(parent=win,title='หลักฐานการโอนจ่าย',filetypes=[('JPG / PNG','*.jpg *.jpeg *.png')])
+                if not path:return
+                if not messagebox.askyesno('EXORA','ยืนยันว่าตรวจผลโอนสำเร็จจากธนาคารแล้ว?',parent=win):return
+                flow.complete(number,actor,reference.get(),path);reload()
+                def sent(result):
+                    if result.get('status')!='sent':messagebox.showwarning('EXORA',result.get('message','ส่งไม่สำเร็จ'),parent=app.root)
+                app.background(lambda:receipts.send_to_user(number,actor),sent)
+            app.button(body,'บันทึกผลโอนสำเร็จและส่งใบเสร็จ',complete).pack(fill='x',pady=15)
+    if row['status']=='completed':
+        app.label(body,'เลขอ้างอิงการโอนจ่าย: '+row['payout_ref'],11,wraplength=740).pack(anchor='w',pady=12)
+        app.button(body,'บันทึก PDF',lambda:app.export_pdf(number)).pack(fill='x',pady=8)
+        app.button(body,'ส่งใบเสร็จทางอีเมล',lambda:app.background(lambda:receipts.send_to_user(number,actor),lambda result:messagebox.showinfo('EXORA',result['message'],parent=app.root)),'secondary').pack(fill='x')

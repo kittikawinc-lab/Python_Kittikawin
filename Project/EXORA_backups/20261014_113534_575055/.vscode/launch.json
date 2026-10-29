@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "EXORA Desktop",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "C:/Users/BB COMPUTER/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe",
+      "program": "${workspaceFolder}/EXORA_main.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "EXORA — Run complete app",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/EXORA_main.py",
+      "python": "C:\\Users\\BB COMPUTER\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
